@@ -1,14 +1,14 @@
-# streamlit_app.py
+# streamlit_app.py  —— 置き換え用フルコード（Strict Auth Gate 版）
 import streamlit as st
-import json, os, re, time, uuid
+import json, os, re
 from datetime import datetime, timedelta, timezone
 from collections import Counter
 from supabase import create_client, Client
 from openai import OpenAI
 
-# -------------------- 設定 --------------------
+# ================== 基本設定 ==================
 st.set_page_config(page_title="Albert β", page_icon="🧭", layout="centered")
-st.title("Albert β（教育支援AIコーチ）")
+st.caption("build: 2025-08-18 Strict-Auth")  # ← 反映確認の目印
 
 # Secrets
 SB_URL = st.secrets.get("SUPABASE_URL")
@@ -17,14 +17,13 @@ OPENAI_KEY = st.secrets.get("OPENAI_API_KEY")
 OPENAI_MODEL = st.secrets.get("OPENAI_MODEL", "gpt-4o-mini")
 
 if not all([SB_URL, SB_KEY, OPENAI_KEY]):
-    st.error("⚠️ Secrets に SUPABASE_URL / SUPABASE_ANON_KEY / OPENAI_API_KEY を設定してください。")
+    st.error("⚠️ Secrets に SUPABASE_URL / SUPABASE_ANON_KEY / OPENAI_API_KEY が必要です。")
     st.stop()
 
-# Clients
-sb: Client = create_client(SB_URL, SB_KEY)
+# OpenAI
 oa = OpenAI(api_key=OPENAI_KEY)
 
-# -------------------- 共通データ --------------------
+# ================== 定数・共通データ ==================
 GROUPED = {
   "子どもの力を信じる": ["子どもの主体性を育てたい","自信を育てたい","自分で選ばせたい"],
   "成長を支える関わり方": ["少し頑張れる課題を出したい","失敗を受け止めたい","プロセスを褒めたい"],
@@ -69,7 +68,7 @@ DEFAULT_POLICY = {
   }
 }
 
-# -------------------- 小ユーティリティ --------------------
+# ================== 小ユーティリティ ==================
 def detect_sensitive(text:str)->bool:
     if not text: return False
     return any(re.search(p, text) for p in SENSITIVE_KEYS)
@@ -78,57 +77,69 @@ def violates_ng(text:str)->bool:
     if not text: return False
     return any(re.search(p, text) for p in NG_PHRASES)
 
-def get_now()->str:
-    return datetime.now(timezone.utc).isoformat()
-
-# 認証トークンを維持
-def get_sb_client_with_token()->Client:
-    token = st.session_state.get("sb_token")
+def sb_client_with_token()->tuple[Client, object|None]:
+    """セッションのトークンを Supabase クライアントに反映し、現在ユーザーを返す"""
     cli = create_client(SB_URL, SB_KEY)
-    if token: cli.auth.set_auth(token)
-    return cli
+    token = st.session_state.get("sb_token")
+    if token:
+        try:
+            cli.auth.set_auth(token)
+        except Exception:
+            pass
+    try:
+        u = cli.auth.get_user()
+    except Exception:
+        u = None
+    return cli, (u.user if (u and getattr(u, "user", None)) else None)
 
-# -------------------- 認証UI（メール+パスワード） --------------------
+# ================== 認証UI ==================
 def auth_view():
     st.subheader("ログイン / 新規登録")
     tab1, tab2 = st.tabs(["ログイン", "新規登録"])
+
     with tab1:
         email = st.text_input("メールアドレス", key="login_email")
         pw = st.text_input("パスワード", type="password", key="login_pw")
-        if st.button("ログイン"):
-            res = sb.auth.sign_in_with_password({"email":email, "password":pw})
-            if res.user:
-                st.session_state["sb_token"] = res.session.access_token
-                st.rerun()
-            else:
-                st.error("ログインに失敗しました。")
+        if st.button("ログイン", use_container_width=True):
+            cli = create_client(SB_URL, SB_KEY)
+            try:
+                res = cli.auth.sign_in_with_password({"email":email, "password":pw})
+                if res and res.session and res.session.access_token:
+                    st.session_state["sb_token"] = res.session.access_token
+                    st.success("ログインしました。")
+                    st.rerun()
+                else:
+                    st.error("ログインに失敗しました。")
+            except Exception as e:
+                st.error(f"ログインに失敗: {e}")
+
     with tab2:
         name = st.text_input("表示名（例：山田先生）", key="reg_name")
         email2 = st.text_input("メールアドレス（新規）", key="reg_email")
         pw2 = st.text_input("パスワード（新規）", type="password", key="reg_pw")
-        if st.button("新規登録"):
-            res = sb.auth.sign_up({"email":email2, "password":pw2})
-            if res.user:
-                # プロフィール行を作成
-                cli = get_sb_client_with_token()  # 未ログインなので作成は後で更新でもOK
-                st.success("登録しました。ログインしてください。")
-            else:
-                st.error("登録に失敗しました。")
+        if st.button("新規登録", use_container_width=True):
+            cli = create_client(SB_URL, SB_KEY)
+            try:
+                res = cli.auth.sign_up({"email":email2, "password":pw2})
+                if res and res.user:
+                    st.success("登録しました。ログインしてください。")
+                else:
+                    st.error("登録に失敗しました。")
+            except Exception as e:
+                st.error(f"登録に失敗: {e}")
 
-# -------------------- プロファイル & 所属 取得/作成 --------------------
+# ================== プロファイル/所属の用意 ==================
 def ensure_profile_and_org():
-    cli = get_sb_client_with_token()
-    u = cli.auth.get_user()
-    if not u or not u.user:
+    cli, user = sb_client_with_token()
+    if not user:
         return None, None, None
+    auth_uid = user.id
+    email = user.email
 
-    auth_uid = u.user.id
-    email = u.user.email
-
-    # users（プロフィール）を upsert
+    # users upsert
     cli.table("users").upsert({"id":auth_uid, "email":email}).execute()
 
-    # 既存所属を取得
+    # 既存の所属
     mem = cli.table("memberships").select("org_id, role, orgs(name)").eq("user_id", auth_uid).execute()
     rows = mem.data or []
     if rows:
@@ -137,18 +148,15 @@ def ensure_profile_and_org():
         org_name = rows[0]["orgs"]["name"]
         return auth_uid, org_id, {"role":role, "org_name":org_name}
 
-    # 所属がなければウィザード
+    # 所属がなければ作成ウィザード
     st.subheader("はじめての設定（組織の作成）")
     org_name = st.text_input("学校/塾名")
-    if st.button("組織を作成して開始"):
+    if st.button("組織を作成して開始", use_container_width=True):
         if not org_name:
             st.warning("名称を入力してください。"); st.stop()
-        # orgs 作成
         org = cli.table("orgs").insert({"name":org_name, "created_by":auth_uid}).execute()
         org_id = org.data[0]["id"]
-        # memberships 自分を admin で作成
         cli.table("memberships").insert({"org_id":org_id, "user_id":auth_uid, "role":"admin"}).execute()
-        # org_policies を初期化
         cli.table("org_policies").insert({
             "org_id":org_id, "tone":DEFAULT_POLICY["tone"],
             "must_include":DEFAULT_POLICY["must_include"],
@@ -157,15 +165,15 @@ def ensure_profile_and_org():
             "value_mapping":DEFAULT_POLICY["value_mapping"],
             "updated_by":auth_uid
         }).execute()
-        st.success("組織を作成しました。次に進みます。")
+        st.success("組織を作成しました。")
         st.rerun()
 
     st.stop()
 
-# -------------------- ポリシー編集（簡易） --------------------
+# ================== ポリシー編集（簡易） ==================
 def policy_editor(org_id):
     st.subheader("学校ポリシー（簡易）")
-    cli = get_sb_client_with_token()
+    cli, _ = sb_client_with_token()
     pol = cli.table("org_policies").select("*").eq("org_id", org_id).execute().data
     if not pol:
         st.info("ポリシーが未設定です。初期値を作成します。")
@@ -178,7 +186,7 @@ def policy_editor(org_id):
         }).execute()
         pol = cli.table("org_policies").select("*").eq("org_id", org_id).execute().data
     p = pol[0]
-    tone = p["tone"]; must = p["must_include"]; avoid = p["avoid_phrases"]; phrase = p["phrasebook"]; vm = p["value_mapping"]
+    phrase = p["phrasebook"]
 
     with st.expander("口調・フレーズ（必要に応じて編集）", expanded=False):
         teacher_open = st.text_input("先生への冒頭", phrase.get("teacher_open",""))
@@ -188,7 +196,7 @@ def policy_editor(org_id):
             cli.table("org_policies").update({"phrasebook":phrase}).eq("id", p["id"]).execute()
             st.success("保存しました。")
 
-# -------------------- 相談フォーム → 生成 → 保存 --------------------
+# ================== 相談 → 生成 → 保存 ==================
 def consult_and_generate(uid, org_id):
     st.subheader("相談")
     with st.form("albert_form"):
@@ -232,7 +240,7 @@ def consult_and_generate(uid, org_id):
             s_q2 = st.radio("Q2. 学校の定めた報告フローに報告済みですか？", ["はい","いいえ"], horizontal=True)
             s_q3 = st.radio("Q3. 被害が想定される子の安全確保は取れていますか？", ["はい","いいえ"], horizontal=True)
 
-        submitted = st.form_submit_button("提案を生成")
+        submitted = st.form_submit_button("提案を生成", use_container_width=True)
         need_stop = any(not v for v in [grade, scale, scene, frequency, urgency, emotion]) or len(values)>4
         if submitted and need_stop:
             st.error("未入力の必須項目または価値観の選びすぎがあります。")
@@ -242,7 +250,7 @@ def consult_and_generate(uid, org_id):
         return
 
     # ポリシー取得
-    cli = get_sb_client_with_token()
+    cli, _ = sb_client_with_token()
     pol = cli.table("org_policies").select("*").eq("org_id", org_id).execute().data[0]
     tone = pol["tone"]; phrase = pol["phrasebook"]
     must_include = "・".join(pol["must_include"])
@@ -302,7 +310,6 @@ def consult_and_generate(uid, org_id):
 - 必須: {must_include}
 - 避ける言い回し: {avoid_words}
 - フレーズ集: 先生冒頭「{phrase.get('teacher_open','')}」/ 保護者冒頭「{phrase.get('parent_open','')}」
-- トーン: 先生={tone.get('teacher','')} / 保護者={tone.get('parent','')} / 低学年={tone.get('student_low','')} / 中高生={tone.get('student_high','')}
 
 {safety_block}
 
@@ -336,6 +343,7 @@ def consult_and_generate(uid, org_id):
     if specificity == "高め（超具体）":
         prompt += "\n【追加制約】各レシピは60〜120字で具体化。固有名詞・数値・具体動作を必ず含める。\n"
 
+    # 生成
     with st.spinner("生成中..."):
         r = oa.chat.completions.create(
             model=OPENAI_MODEL,
@@ -343,7 +351,8 @@ def consult_and_generate(uid, org_id):
             temperature=0.45, max_tokens=1200
         )
         text = r.choices[0].message.content
-        if needs_safety and violates_ng(text):
+        # セーフティ・チェック
+        if detect_sensitive(message) and violates_ng(text):
             fix = "【修正指示】安全最優先・分離と見守り・記録と報告を前提に、被害側の曝露を避け、個別/環境調整中心で再提案。"
             r2 = oa.chat.completions.create(
                 model=OPENAI_MODEL,
@@ -352,7 +361,7 @@ def consult_and_generate(uid, org_id):
             )
             text = r2.choices[0].message.content
 
-    # 相談保存 → 回答保存
+    # 保存
     topics = []
     rules = [
         (r"いじめ|暴力|脅|自傷|自殺|安全|被害", "安全/人間関係"),
@@ -367,6 +376,7 @@ def consult_and_generate(uid, org_id):
         if re.search(pat, message): topics.append(tag)
     if not topics: topics = ["未分類"]
 
+    cli, _ = sb_client_with_token()
     cli.table("consultations").insert({
         "org_id": org_id, "user_id": uid, "grade": grade, "scale": scale, "scene": scene,
         "frequency": frequency, "urgency": urgency, "emotion": emotion, "subject": subject,
@@ -376,15 +386,14 @@ def consult_and_generate(uid, org_id):
         "topics": topics
     }).execute()
 
-    # 最新相談を取得（今挿したもの）
+    # 直近を取得して answers 連携
     cons = cli.table("consultations").select("id").eq("user_id", uid).order("created_at", desc=True).limit(1).execute().data[0]
     cid = cons["id"]
-
     cli.table("answers").insert({
-        "consultation_id": cid, "model": OPENAI_MODEL, "safety_mode": needs_safety,
-        "text": text
+        "consultation_id": cid, "model": OPENAI_MODEL, "safety_mode": needs_safety, "text": text
     }).execute()
 
+    # 表示
     st.caption("この入力で生成： " + " / ".join([x for x in [grade, scene, timebox, urgency, emotion] if x]))
     st.markdown(text)
 
@@ -402,16 +411,15 @@ def consult_and_generate(uid, org_id):
             }).execute()
             st.success("保存しました。次回以降の最適化に使われます。")
 
-# -------------------- ダッシュボード（最小KPI） --------------------
+# ================== ダッシュボード（最小） ==================
 def dashboard(org_id):
     st.subheader("ダッシュボード（β・最小）")
-    cli = get_sb_client_with_token()
-    # 期間フィルタ：既定28日
+    cli, _ = sb_client_with_token()
     days = st.selectbox("期間", [7,28,90], index=1)
     since = (datetime.utcnow() - timedelta(days=days)).isoformat()
 
     cons = cli.table("consultations").select("*").eq("org_id", org_id).gte("created_at", since).execute().data or []
-    answers = cli.table("answers").select("id, consultation_id, created_at").execute().data or []
+    answers = cli.table("answers").select("id, consultation_id, created_at, text").execute().data or []
     fbs = cli.table("feedbacks").select("*").eq("org_id", org_id).gte("created_at", since).execute().data or []
 
     # 1) 行動実行率
@@ -423,10 +431,10 @@ def dashboard(org_id):
     helpful = [fb for fb in fbs if fb["rating"]=="good"]
     helpful_rate = round(100*len(helpful)/max(len(fbs),1), 1)
 
-    # 3) 再生成率（粗く：feedbackメモに「再」など/将来は別カラム）
+    # 3) 再生成率（仮：メモに「再」が含まれる割合）
     regen_rate = round(100*len([fb for fb in fbs if "再" in (fb.get("note") or "")])/max(len(answers),1), 1)
 
-    # 4) 時間適合率（理由に「時間に合わない」を含まない割合）
+    # 4) 時間適合率
     bad_time = sum([1 for fb in fbs if "時間に合わない" in (fb.get("reasons") or [])])
     time_fit_rate = round(100*(1 - bad_time/max(len(fbs),1)), 1)
 
@@ -434,16 +442,12 @@ def dashboard(org_id):
     sens = sum([1 for c in cons if c["sensitive_flag"]])
     sens_rate = round(100*sens/max(len(cons),1), 1)
 
-    # 6) ポリシー整合率（β：避け語が本文に出ていない割合）
+    # 6) ポリシー整合率（簡易：避け語が本文に出ていない割合）
     pol = cli.table("org_policies").select("avoid_phrases").eq("org_id", org_id).execute().data[0]
     avoid = pol["avoid_phrases"] or []
     def violates(text):
         return any(w in (text or "") for w in avoid)
-    bad_policy = 0
-    for a in answers:
-        # 本来は join するが簡易に最新N件を対象に
-        at = cli.table("answers").select("text").eq("id", a["id"]).execute().data[0]["text"]
-        if violates(at): bad_policy += 1
+    bad_policy = sum(1 for a in answers if violates(a["text"]))
     policy_ok_rate = round(100*(1 - bad_policy/max(len(answers),1)), 1)
 
     c1,c2,c3 = st.columns(3)
@@ -465,23 +469,35 @@ def dashboard(org_id):
         for k,v in topics.most_common(10):
             st.write(f"- {k}: {v}")
 
-# -------------------- メイン制御 --------------------
+# ================== メイン ==================
 def main():
-    # 認証済判定
+    # 🔐 厳格ログインガード（セッションに頼らず毎回 Supabase に確認）
+    cli = create_client(SB_URL, SB_KEY)
     token = st.session_state.get("sb_token")
-    if not token:
-        auth_view()
-        return
+    if token:
+        try:
+            cli.auth.set_auth(token)
+        except Exception:
+            pass
+    try:
+        res = cli.auth.get_user()
+        current_user = res.user if res and getattr(res, "user", None) else None
+    except Exception:
+        current_user = None
 
-    # プロファイルと所属チェック（なければ作成ウィザードへ）
+    if not current_user:
+        # 念のため古いトークンを破棄
+        st.session_state.pop("sb_token", None)
+        auth_view()
+        st.stop()  # ← ここが重要（以降を描画しない）
+
+    # 認証済み：プロフィールと所属を確保
     uid, org_id, meta = ensure_profile_and_org()
     st.sidebar.success(f"{meta['org_name']}（{meta['role']}）としてログイン中")
     if st.sidebar.button("ログアウト"):
         st.session_state.clear(); st.rerun()
 
-    # タブ：相談 / ダッシュボード / 設定
     tab = st.sidebar.radio("メニュー", ["相談","ダッシュボード","設定"])
-
     if tab == "相談":
         consult_and_generate(uid, org_id)
     elif tab == "ダッシュボード":
@@ -490,4 +506,5 @@ def main():
         policy_editor(org_id)
         st.info("※ 詳細な管理画面は今後拡充します。")
 
+# 起動
 main()
