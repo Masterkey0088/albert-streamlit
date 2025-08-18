@@ -1,43 +1,48 @@
 # streamlit_app.py
 import streamlit as st
-import json, os, re, uuid, time
+import json, os, re, time, uuid
+from datetime import datetime, timedelta, timezone
 from collections import Counter
+from supabase import create_client, Client
 from openai import OpenAI
 
-# ====== 画面設定 ======
+# -------------------- 設定 --------------------
 st.set_page_config(page_title="Albert β", page_icon="🧭", layout="centered")
 st.title("Albert β（教育支援AIコーチ）")
-st.caption("価値観×状況に沿って、明日ためせる具体策＋根拠で支援します。")
 
-# ====== OpenAI クライアント ======
-API_KEY = st.secrets.get("OPENAI_API_KEY")
-MODEL   = st.secrets.get("OPENAI_MODEL", "gpt-4o-mini")  # 例: gpt-4o-mini / gpt-4.1-mini 等
-if not API_KEY:
-    st.error("⚠️ StreamlitのSecretsに OPENAI_API_KEY を設定してください（[Manage app → Settings → Secrets]）。")
+# Secrets
+SB_URL = st.secrets.get("SUPABASE_URL")
+SB_KEY = st.secrets.get("SUPABASE_ANON_KEY")
+OPENAI_KEY = st.secrets.get("OPENAI_API_KEY")
+OPENAI_MODEL = st.secrets.get("OPENAI_MODEL", "gpt-4o-mini")
+
+if not all([SB_URL, SB_KEY, OPENAI_KEY]):
+    st.error("⚠️ Secrets に SUPABASE_URL / SUPABASE_ANON_KEY / OPENAI_API_KEY を設定してください。")
     st.stop()
-client = OpenAI(api_key=API_KEY)
 
-# ====== 保存先（βはJSONファイルに簡易保存） ======
-MEM_PATH    = "albert_memory.json"    # フィードバック学習
-EVENTS_PATH = "albert_events.json"    # 相談ログ（匿名集計）
-POLICY_PATH = "albert_policy.json"    # 学校ポリシー（同梱 or 後から編集）
+# Clients
+sb: Client = create_client(SB_URL, SB_KEY)
+oa = OpenAI(api_key=OPENAI_KEY)
 
-def load_json(path, default):
-    try:
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return default
+# -------------------- 共通データ --------------------
+GROUPED = {
+  "子どもの力を信じる": ["子どもの主体性を育てたい","自信を育てたい","自分で選ばせたい"],
+  "成長を支える関わり方": ["少し頑張れる課題を出したい","失敗を受け止めたい","プロセスを褒めたい"],
+  "温かい人間関係": ["安心できる雰囲気をつくりたい","ありのままを受け入れたい","相手の話に耳を傾けたい"]
+}
+REASONS = ["抽象的すぎる","学年フィット不足","時間に合わない","準備物が不明","声かけが弱い","安全面が不十分","保護者対応が不足","根拠が薄い"]
 
-def save_json(path, data):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+SENSITIVE_KEYS = [
+    "いじめ","いじ(め|り)","暴力","殴","蹴","排除","無視","仲間はずれ","脅",
+    "金(を|の)要求","晒し","SNS","ネットいじめ","自傷","自殺","死にたい",
+    "ハラスメント","性(的|被害)","体罰","恐喝","集団で","標的","陰口"
+]
+NG_PHRASES = [
+    "その場で(謝|和解)させる","仲直りさせる","両者をすぐ対面させる",
+    "被害者.*同席させる","全員で.*活動させる","我慢させる","許させる","被害者.*配慮なく"
+]
 
-# ====== ポリシー（なければ最小デフォルトを生成） ======
 DEFAULT_POLICY = {
-  "school_name": "デフォルト校",
   "tone": {
     "teacher": "最初にねぎらい→要点→次の一歩。断定/否定を避け選択肢で提案。",
     "parent":  "不安を下げる語彙。1行要約→丁寧文。家庭でできる観察/声かけを具体に。",
@@ -63,139 +68,190 @@ DEFAULT_POLICY = {
     "相手の話に耳を傾けたい":    ["アクティブリスニング","共感"]
   }
 }
-if not os.path.exists(POLICY_PATH):
-    save_json(POLICY_PATH, DEFAULT_POLICY)
-policy = load_json(POLICY_PATH, DEFAULT_POLICY)
 
-# ====== 価値観カテゴリ ======
-GROUPED = {
-  "子どもの力を信じる": ["子どもの主体性を育てたい","自信を育てたい","自分で選ばせたい"],
-  "成長を支える関わり方": ["少し頑張れる課題を出したい","失敗を受け止めたい","プロセスを褒めたい"],
-  "温かい人間関係": ["安心できる雰囲気をつくりたい","ありのままを受け入れたい","相手の話に耳を傾けたい"]
-}
-REASONS = ["抽象的すぎる","学年フィット不足","時間に合わない","準備物が不明","声かけが弱い","安全面が不十分","保護者対応が不足","根拠が薄い"]
-
-# ====== センシティブ検出/NG表現 ======
-SENSITIVE_KEYS = [
-    "いじめ","いじ(め|り)","暴力","殴","蹴","排除","無視","仲間はずれ","脅",
-    "金(を|の)要求","晒し","SNS","ネットいじめ","自傷","自殺","死にたい",
-    "ハラスメント","性(的|被害)","体罰","恐喝","集団で","標的","陰口"
-]
-NG_PHRASES = [
-    "その場で(謝|和解)させる","仲直りさせる","両者をすぐ対面させる",
-    "被害者.*同席させる","全員で.*活動させる","我慢させる","許させる","被害者.*配慮なく"
-]
-def detect_sensitive(text: str) -> bool:
+# -------------------- 小ユーティリティ --------------------
+def detect_sensitive(text:str)->bool:
     if not text: return False
     return any(re.search(p, text) for p in SENSITIVE_KEYS)
-def violates_ng(text: str) -> bool:
+
+def violates_ng(text:str)->bool:
     if not text: return False
     return any(re.search(p, text) for p in NG_PHRASES)
 
-# ====== 個別化ヒント（フィードバックから） ======
-def build_personalization(feedbacks: list) -> str:
-    if not feedbacks: return ""
-    val = Counter(); spec = Counter(); timeb = Counter(); subj = Counter(); bad = Counter()
-    for fb in feedbacks:
-        ui = fb.get("input", {})
-        rt = fb.get("rating")
-        if rt in ("good","ok"):
-            for v in ui.get("values", []): val[v]+=1
-            spec[ui.get("specificity","")] += 1
-            timeb[ui.get("timebox","")]    += 1
-            subj[ui.get("subject","")]     += 1
-        if rt == "bad":
-            for r in fb.get("reasons", []): bad[r]+=1
-    def top2(c): return "・".join([k for k,_ in c.most_common(2) if k and k!="未指定"])
-    lines=[]
-    for label,cnt in [("好まれる具体度",spec),("よく選ぶ時間枠",timeb),("大切にされやすい価値観",val),("教科の傾向",subj),("避けたい傾向",bad)]:
-        t=top2(cnt)
-        if t: lines.append(f"- {label}: {t}")
-    return "【個別化ヒント】\n" + "\n".join(lines) + "\n" if lines else ""
+def get_now()->str:
+    return datetime.now(timezone.utc).isoformat()
 
-# ====== タイプライタ（擬似段階表示） ======
-def typewriter(md_container, text: str, step=0.02):
-    buf = ""
-    for i in range(0, len(text), 80):
-        buf = text[:i+80]
-        md_container.markdown(buf)
-        time.sleep(step)
+# 認証トークンを維持
+def get_sb_client_with_token()->Client:
+    token = st.session_state.get("sb_token")
+    cli = create_client(SB_URL, SB_KEY)
+    if token: cli.auth.set_auth(token)
+    return cli
 
-st.write("—")
+# -------------------- 認証UI（メール+パスワード） --------------------
+def auth_view():
+    st.subheader("ログイン / 新規登録")
+    tab1, tab2 = st.tabs(["ログイン", "新規登録"])
+    with tab1:
+        email = st.text_input("メールアドレス", key="login_email")
+        pw = st.text_input("パスワード", type="password", key="login_pw")
+        if st.button("ログイン"):
+            res = sb.auth.sign_in_with_password({"email":email, "password":pw})
+            if res.user:
+                st.session_state["sb_token"] = res.session.access_token
+                st.rerun()
+            else:
+                st.error("ログインに失敗しました。")
+    with tab2:
+        name = st.text_input("表示名（例：山田先生）", key="reg_name")
+        email2 = st.text_input("メールアドレス（新規）", key="reg_email")
+        pw2 = st.text_input("パスワード（新規）", type="password", key="reg_pw")
+        if st.button("新規登録"):
+            res = sb.auth.sign_up({"email":email2, "password":pw2})
+            if res.user:
+                # プロフィール行を作成
+                cli = get_sb_client_with_token()  # 未ログインなので作成は後で更新でもOK
+                st.success("登録しました。ログインしてください。")
+            else:
+                st.error("登録に失敗しました。")
 
-# ====== 入力フォーム ======
-with st.form("albert_form", clear_on_submit=False):
-    c1, c2 = st.columns(2)
-    grade = c1.selectbox("学年 / 年齢", ["","幼児","小1-2","小3-4","小5-6","中1-3","高1-3","大学・成人","その他"])
-    scale = c2.selectbox("人数・規模", ["","個別","数人（2-5）","小グループ（6-10）","学級全体"])
+# -------------------- プロファイル & 所属 取得/作成 --------------------
+def ensure_profile_and_org():
+    cli = get_sb_client_with_token()
+    u = cli.auth.get_user()
+    if not u or not u.user:
+        return None, None, None
 
-    c3, c4 = st.columns(2)
-    scene = c3.selectbox("場面", ["","授業中","授業準備・片付け","休み時間","HR・学活","行事","保護者対応","部活動","オンライン学習"])
-    frequency = c4.selectbox("頻度", ["","初回","時々","継続的（週1-2）","慢性的（ほぼ毎回）"])
+    auth_uid = u.user.id
+    email = u.user.email
 
-    c5, c6 = st.columns(2)
-    urgency = c5.selectbox("緊急度", ["","低","中","高"])
-    emotion = c6.selectbox("あなたの今の気持ち", ["","困惑","焦り","怒り","心配","無力感","期待","落ち着いている"])
+    # users（プロフィール）を upsert
+    cli.table("users").upsert({"id":auth_uid, "email":email}).execute()
 
-    c7, c8 = st.columns(2)
-    subject = c7.selectbox("教科", ["未指定","国語","算数/数学","理科","社会","英語","体育","音楽","美術/図工","技家","総合"])
-    timebox = c8.selectbox("時間制約（実施可能目安）", ["未指定","~5分","~10分","~15分","~30分"])
+    # 既存所属を取得
+    mem = cli.table("memberships").select("org_id, role, orgs(name)").eq("user_id", auth_uid).execute()
+    rows = mem.data or []
+    if rows:
+        org_id = rows[0]["org_id"]
+        role = rows[0]["role"]
+        org_name = rows[0]["orgs"]["name"]
+        return auth_uid, org_id, {"role":role, "org_name":org_name}
 
-    specificity = st.selectbox("具体度レベル", ["標準","高め（超具体）"])
+    # 所属がなければウィザード
+    st.subheader("はじめての設定（組織の作成）")
+    org_name = st.text_input("学校/塾名")
+    if st.button("組織を作成して開始"):
+        if not org_name:
+            st.warning("名称を入力してください。"); st.stop()
+        # orgs 作成
+        org = cli.table("orgs").insert({"name":org_name, "created_by":auth_uid}).execute()
+        org_id = org.data[0]["id"]
+        # memberships 自分を admin で作成
+        cli.table("memberships").insert({"org_id":org_id, "user_id":auth_uid, "role":"admin"}).execute()
+        # org_policies を初期化
+        cli.table("org_policies").insert({
+            "org_id":org_id, "tone":DEFAULT_POLICY["tone"],
+            "must_include":DEFAULT_POLICY["must_include"],
+            "avoid_phrases":DEFAULT_POLICY["avoid_phrases"],
+            "phrasebook":DEFAULT_POLICY["phrasebook"],
+            "value_mapping":DEFAULT_POLICY["value_mapping"],
+            "updated_by":auth_uid
+        }).execute()
+        st.success("組織を作成しました。次に進みます。")
+        st.rerun()
 
-    message = st.text_area("相談内容（状況をできるだけ具体的に）", height=110,
-                           placeholder="例）小2の算数で立ち歩きが増加。席後方から前に移動して声かけるも効果薄…")
-    attempts = st.text_area("これまで試したこと（100字以内）", height=70, max_chars=100,
-                            placeholder="例）席替え、注意、係活動の導入 など")
+    st.stop()
 
-    st.markdown("**あなたが大切にしていること（最大4つまで）**")
-    values = []
-    for sec, opts in GROUPED.items():
-        st.caption(sec)
-        selected = st.multiselect("　", opts, key=f"vals_{sec}", label_visibility="collapsed")
-        values.extend(selected)
-    if len(values) > 4:
-        st.warning("価値観は最大4つまでにしてください。")
+# -------------------- ポリシー編集（簡易） --------------------
+def policy_editor(org_id):
+    st.subheader("学校ポリシー（簡易）")
+    cli = get_sb_client_with_token()
+    pol = cli.table("org_policies").select("*").eq("org_id", org_id).execute().data
+    if not pol:
+        st.info("ポリシーが未設定です。初期値を作成します。")
+        cli.table("org_policies").insert({
+            "org_id":org_id, "tone":DEFAULT_POLICY["tone"],
+            "must_include":DEFAULT_POLICY["must_include"],
+            "avoid_phrases":DEFAULT_POLICY["avoid_phrases"],
+            "phrasebook":DEFAULT_POLICY["phrasebook"],
+            "value_mapping":DEFAULT_POLICY["value_mapping"]
+        }).execute()
+        pol = cli.table("org_policies").select("*").eq("org_id", org_id).execute().data
+    p = pol[0]
+    tone = p["tone"]; must = p["must_include"]; avoid = p["avoid_phrases"]; phrase = p["phrasebook"]; vm = p["value_mapping"]
 
-    sensitive_flag = st.checkbox("センシティブ（いじめ/暴力/脅し/自傷示唆 等）に該当する可能性がある")
-    auto_sensitive = detect_sensitive(message)
-    show_safety = sensitive_flag or auto_sensitive
+    with st.expander("口調・フレーズ（必要に応じて編集）", expanded=False):
+        teacher_open = st.text_input("先生への冒頭", phrase.get("teacher_open",""))
+        parent_open  = st.text_input("保護者への冒頭", phrase.get("parent_open",""))
+        if st.button("フレーズを保存"):
+            phrase["teacher_open"]=teacher_open; phrase["parent_open"]=parent_open
+            cli.table("org_policies").update({"phrasebook":phrase}).eq("id", p["id"]).execute()
+            st.success("保存しました。")
 
-    if show_safety:
-        st.info("安全優先：被害が想定される子の曝露は避け、学校の報告手順に従ってください。")
-        s_q1 = st.radio("Q1. 継続的な標的化や危害が現在ありますか？", ["はい","いいえ","不明"], horizontal=True)
-        s_q2 = st.radio("Q2. 学校の定めた報告フローに報告済みですか？", ["はい","いいえ"], horizontal=True)
-        s_q3 = st.radio("Q3. 被害が想定される子の安全確保は取れていますか？", ["はい","いいえ"], horizontal=True)
-    else:
+# -------------------- 相談フォーム → 生成 → 保存 --------------------
+def consult_and_generate(uid, org_id):
+    st.subheader("相談")
+    with st.form("albert_form"):
+        c1, c2 = st.columns(2)
+        grade = c1.selectbox("学年 / 年齢", ["","幼児","小1-2","小3-4","小5-6","中1-3","高1-3","大学・成人","その他"])
+        scale = c2.selectbox("人数・規模", ["","個別","数人（2-5）","小グループ（6-10）","学級全体"])
+
+        c3, c4 = st.columns(2)
+        scene = c3.selectbox("場面", ["","授業中","授業準備・片付け","休み時間","HR・学活","行事","保護者対応","部活動","オンライン学習"])
+        frequency = c4.selectbox("頻度", ["","初回","時々","継続的（週1-2）","慢性的（ほぼ毎回）"])
+
+        c5, c6 = st.columns(2)
+        urgency = c5.selectbox("緊急度", ["","低","中","高"])
+        emotion = c6.selectbox("あなたの今の気持ち", ["","困惑","焦り","怒り","心配","無力感","期待","落ち着いている"])
+
+        c7, c8 = st.columns(2)
+        subject = c7.selectbox("教科", ["未指定","国語","算数/数学","理科","社会","英語","体育","音楽","美術/図工","技家","総合"])
+        timebox = c8.selectbox("時間制約（実施可能目安）", ["未指定","~5分","~10分","~15分","~30分"])
+
+        specificity = st.selectbox("具体度レベル", ["標準","高め（超具体）"])
+        message = st.text_area("相談内容（できるだけ具体に）", height=110)
+        attempts = st.text_area("これまで試したこと（100字以内）", height=70, max_chars=100)
+
+        st.markdown("**あなたが大切にしていること（最大4つ）**")
+        values = []
+        for sec, opts in GROUPED.items():
+            st.caption(sec)
+            selected = st.multiselect("　", opts, key=f"vals_{sec}", label_visibility="collapsed")
+            values.extend(selected)
+        if len(values) > 4:
+            st.warning("価値観は最大4つまでにしてください。")
+
+        sensitive_flag = st.checkbox("センシティブ（いじめ/暴力/脅し/自傷示唆 等）の可能性")
+        auto_sensitive = detect_sensitive(message)
+        show_safety = sensitive_flag or auto_sensitive
+
         s_q1=s_q2=s_q3=""
+        if show_safety:
+            st.info("安全優先：被害が想定される子の曝露は避け、学校の報告手順に従ってください。")
+            s_q1 = st.radio("Q1. 継続的な標的化や危害が現在ありますか？", ["はい","いいえ","不明"], horizontal=True)
+            s_q2 = st.radio("Q2. 学校の定めた報告フローに報告済みですか？", ["はい","いいえ"], horizontal=True)
+            s_q3 = st.radio("Q3. 被害が想定される子の安全確保は取れていますか？", ["はい","いいえ"], horizontal=True)
 
-    submitted = st.form_submit_button("提案を生成")
-    need_stop = any(not v for v in [grade, scale, scene, frequency, urgency, emotion]) or len(values)>4
-    if submitted and need_stop:
-        st.error("未入力の必須項目または価値観の選びすぎがあります。")
-        submitted = False
+        submitted = st.form_submit_button("提案を生成")
+        need_stop = any(not v for v in [grade, scale, scene, frequency, urgency, emotion]) or len(values)>4
+        if submitted and need_stop:
+            st.error("未入力の必須項目または価値観の選びすぎがあります。")
+            submitted = False
 
-# ====== 生成処理 ======
-if submitted:
-    # 個別化ヒント（直近フィードバックから）
-    mem = load_json(MEM_PATH, {"users":{}})
-    uid = st.session_state.get("uid") or uuid.uuid4().hex
-    st.session_state["uid"] = uid
-    feedbacks = mem.get("users", {}).get(uid, {}).get("feedback", [])
-    personalization = build_personalization(feedbacks)
+    if not submitted:
+        return
 
-    # ポリシー抽出
-    tone = policy.get("tone",{})
-    phrase = policy.get("phrasebook",{})
-    must_include = "・".join(policy.get("must_include",[]))
-    avoid_words  = "・".join(policy.get("avoid_phrases",[]))
+    # ポリシー取得
+    cli = get_sb_client_with_token()
+    pol = cli.table("org_policies").select("*").eq("org_id", org_id).execute().data[0]
+    tone = pol["tone"]; phrase = pol["phrasebook"]
+    must_include = "・".join(pol["must_include"])
+    avoid_words  = "・".join(pol["avoid_phrases"])
+    vmapping = pol["value_mapping"]
 
-    # 価値観タグ
-    vmapping = policy.get("value_mapping",{})
     vtags = []
     for v in values: vtags += vmapping.get(v, [])
     vtags = "｜".join(sorted(set(vtags))) if vtags else "（無し）"
-
     value_text = "\n".join([f"- {v}" for v in values]) if values else "（特に指定なし）"
 
     safety_block = ""
@@ -209,7 +265,6 @@ if submitted:
 - 安全確認: Q1={s_q1} / Q2={s_q2} / Q3={s_q3}
 """
 
-    # few-shot（簡略）と理論カタログ
     fewshot = """
 【例】
 相談: 授業中に立ち歩く小2男子がいる
@@ -239,7 +294,6 @@ if submitted:
 - スモールステップ・強化（Skinner）/ タイムオンタスク / PBIS
 """
 
-    # Single-Shot MAX プロンプト
     prompt = f"""
 あなたは教育支援AI「Albert」。先生を支え、子どもの成長と保護者の安心を後押しし、学校の価値観に合う提案だけを返します。
 出力は「ねぎらい→具体策→言い換え（保護者/生徒）→観察→注意」。
@@ -250,7 +304,6 @@ if submitted:
 - フレーズ集: 先生冒頭「{phrase.get('teacher_open','')}」/ 保護者冒頭「{phrase.get('parent_open','')}」
 - トーン: 先生={tone.get('teacher','')} / 保護者={tone.get('parent','')} / 低学年={tone.get('student_low','')} / 中高生={tone.get('student_high','')}
 
-{personalization}
 {safety_block}
 
 【与件】
@@ -283,38 +336,25 @@ if submitted:
     if specificity == "高め（超具体）":
         prompt += "\n【追加制約】各レシピは60〜120字で具体化。固有名詞・数値・具体動作を必ず含める。\n"
 
-    # 生成
     with st.spinner("生成中..."):
-        res = client.chat.completions.create(
-            model=MODEL,
+        r = oa.chat.completions.create(
+            model=OPENAI_MODEL,
             messages=[{"role":"system","content": fewshot + "\n" + prompt}],
             temperature=0.45, max_tokens=1200
         )
-        text = res.choices[0].message.content
-
-        # 安全NGが含まれていれば再生成
+        text = r.choices[0].message.content
         if needs_safety and violates_ng(text):
             fix = "【修正指示】安全最優先・分離と見守り・記録と報告を前提に、被害側の曝露を避け、個別/環境調整中心で再提案。"
-            res2 = client.chat.completions.create(
-                model=MODEL,
+            r2 = oa.chat.completions.create(
+                model=OPENAI_MODEL,
                 messages=[{"role":"system","content": fewshot + "\n" + prompt + "\n" + fix}],
                 temperature=0.4, max_tokens=1200
             )
-            text = res2.choices[0].message.content
+            text = r2.choices[0].message.content
 
-    # スナップショット
-    chips = [grade, scale, scene, frequency, urgency, emotion, subject, timebox] + values + (["安全モード"] if needs_safety else [])
-    st.caption("この入力で生成：　" + " / ".join([c for c in chips if c]))
-
-    # タイプライタ表示
-    holder = st.empty()
-    typewriter(holder, text, step=0.02)
-
-    # 相談ログ（匿名）を保存
-    events = load_json(EVENTS_PATH, {"events":[]})
-    sid = st.session_state.get("sid") or uuid.uuid4().hex
-    st.session_state["sid"] = sid
-    topic_rules = [
+    # 相談保存 → 回答保存
+    topics = []
+    rules = [
         (r"いじめ|暴力|脅|自傷|自殺|安全|被害", "安全/人間関係"),
         (r"保護者|家庭|連絡|面談", "保護者対応"),
         (r"提出|宿題|課題|忘れ|未提出", "課題・提出"),
@@ -323,56 +363,131 @@ if submitted:
         (r"評価|テスト|成績|アセスメント", "評価"),
         (r"友だち|仲間|グループ|孤立", "関係性"),
     ]
-    tags=set()
-    for pat, tag in topic_rules:
-        if re.search(pat, message): tags.add(tag)
-    if not tags: tags={"未分類"}
-    events["events"].append({
-        "ts": time.time(),
-        "user": sid,
-        "grade": grade, "scene": scene, "urgency": urgency, "emotion": emotion,
-        "subject": subject, "timebox": timebox, "values": values,
-        "sensitive": needs_safety, "topics": sorted(list(tags))
-    })
-    events["events"] = events["events"][-500:]
-    save_json(EVENTS_PATH, events)
+    for pat, tag in rules:
+        if re.search(pat, message): topics.append(tag)
+    if not topics: topics = ["未分類"]
 
-    # フィードバック保存＆再生成（追記）
-    with st.expander("しっくりきませんか？ フィードバック / 追記して再生成"):
+    cli.table("consultations").insert({
+        "org_id": org_id, "user_id": uid, "grade": grade, "scale": scale, "scene": scene,
+        "frequency": frequency, "urgency": urgency, "emotion": emotion, "subject": subject,
+        "timebox": timebox, "specificity": specificity, "message": message, "attempts": attempts,
+        "values": values, "sensitive_flag": needs_safety,
+        "safety_answers": {"q1": s_q1, "q2":s_q2, "q3":s_q3} if needs_safety else None,
+        "topics": topics
+    }).execute()
+
+    # 最新相談を取得（今挿したもの）
+    cons = cli.table("consultations").select("id").eq("user_id", uid).order("created_at", desc=True).limit(1).execute().data[0]
+    cid = cons["id"]
+
+    cli.table("answers").insert({
+        "consultation_id": cid, "model": OPENAI_MODEL, "safety_mode": needs_safety,
+        "text": text
+    }).execute()
+
+    st.caption("この入力で生成： " + " / ".join([x for x in [grade, scene, timebox, urgency, emotion] if x]))
+    st.markdown(text)
+
+    # フィードバック
+    with st.expander("しっくりきませんか？ フィードバック"):
         c1, c2 = st.columns([1,2])
         rating = c1.radio("役立ち度", ["good","ok","bad"], horizontal=True, index=1)
         reasons = c2.multiselect("不足していた点（複数可）", REASONS)
-        note = st.text_input("メモ（任意）", placeholder="例）保護者への伝え方を厚めに")
-        refine = st.text_input("この追記で再生成（任意）", placeholder="例）声かけ例を3つ、所要時間は10分以内に")
-        b1, b2 = st.columns(2)
-        if b1.button("フィードバックを保存"):
-            mem = load_json(MEM_PATH, {"users":{}})
-            u = mem["users"].setdefault(uid, {"feedback":[]})
-            u["feedback"].append({
-                "res_id": str(uuid.uuid4().hex),
-                "rating": rating, "reasons": reasons, "note": note,
-                "input": {
-                    "grade": grade, "scale": scale, "scene": scene, "frequency": frequency,
-                    "urgency": urgency, "emotion": emotion, "subject": subject, "timebox": timebox,
-                    "specificity": specificity, "values": values
-                }
-            })
-            u["feedback"] = u["feedback"][-200:]
-            save_json(MEM_PATH, mem)
-            st.success("保存しました。次回の提案に反映されます。")
+        note = st.text_input("メモ（任意）")
+        if st.button("フィードバックを保存"):
+            ans = cli.table("answers").select("id").eq("consultation_id", cid).order("created_at", desc=True).limit(1).execute().data[0]
+            cli.table("feedbacks").insert({
+                "answer_id": ans["id"], "org_id": org_id, "user_id": uid,
+                "rating": rating, "reasons": reasons, "note": note
+            }).execute()
+            st.success("保存しました。次回以降の最適化に使われます。")
 
-        if b2.button("追記して再生成") and refine.strip():
-            st.session_state["refine_override"] = refine.strip()
-            st.rerun()
+# -------------------- ダッシュボード（最小KPI） --------------------
+def dashboard(org_id):
+    st.subheader("ダッシュボード（β・最小）")
+    cli = get_sb_client_with_token()
+    # 期間フィルタ：既定28日
+    days = st.selectbox("期間", [7,28,90], index=1)
+    since = (datetime.utcnow() - timedelta(days=days)).isoformat()
 
-# 追記があれば自動再生成（簡易）
-if ro := st.session_state.get("refine_override"):
-    st.session_state["refine_override"] = ""
-    st.info(f"追加指定：{ro}")
+    cons = cli.table("consultations").select("*").eq("org_id", org_id).gte("created_at", since).execute().data or []
+    answers = cli.table("answers").select("id, consultation_id, created_at").execute().data or []
+    fbs = cli.table("feedbacks").select("*").eq("org_id", org_id).gte("created_at", since).execute().data or []
 
-    # 直近入力がフォームに残っている前提で、追加指定だけつけて再生成
-    # （簡易版：プロンプト末尾に追記するだけ）
-    # 値の取得
-    grade = st.session_state.get("albert_form-grade", "") or st.session_state.get("grade", "")
-    # 以降は上の生成処理を関数化して呼ぶのが理想だが、βでは一旦ここで終了
-    st.warning("再生成は上の『提案を生成』をもう一度押してください（追加指定は反映されます）。")
+    # 1) 行動実行率
+    teacher_count = len(set([c["user_id"] for c in cons])) or 1
+    weeks = max(days/7.0, 1.0)
+    action_rate = round(len(cons)/teacher_count/weeks, 2)
+
+    # 2) Helpful率
+    helpful = [fb for fb in fbs if fb["rating"]=="good"]
+    helpful_rate = round(100*len(helpful)/max(len(fbs),1), 1)
+
+    # 3) 再生成率（粗く：feedbackメモに「再」など/将来は別カラム）
+    regen_rate = round(100*len([fb for fb in fbs if "再" in (fb.get("note") or "")])/max(len(answers),1), 1)
+
+    # 4) 時間適合率（理由に「時間に合わない」を含まない割合）
+    bad_time = sum([1 for fb in fbs if "時間に合わない" in (fb.get("reasons") or [])])
+    time_fit_rate = round(100*(1 - bad_time/max(len(fbs),1)), 1)
+
+    # 5) センシティブ比率
+    sens = sum([1 for c in cons if c["sensitive_flag"]])
+    sens_rate = round(100*sens/max(len(cons),1), 1)
+
+    # 6) ポリシー整合率（β：避け語が本文に出ていない割合）
+    pol = cli.table("org_policies").select("avoid_phrases").eq("org_id", org_id).execute().data[0]
+    avoid = pol["avoid_phrases"] or []
+    def violates(text):
+        return any(w in (text or "") for w in avoid)
+    bad_policy = 0
+    for a in answers:
+        # 本来は join するが簡易に最新N件を対象に
+        at = cli.table("answers").select("text").eq("id", a["id"]).execute().data[0]["text"]
+        if violates(at): bad_policy += 1
+    policy_ok_rate = round(100*(1 - bad_policy/max(len(answers),1)), 1)
+
+    c1,c2,c3 = st.columns(3)
+    c1.metric("行動実行率 / 週（主KPI）", action_rate)
+    c2.metric("Helpful率（%）", helpful_rate)
+    c3.metric("再生成率（%）", regen_rate)
+    c4,c5,c6 = st.columns(3)
+    c4.metric("時間適合率（%）", time_fit_rate)
+    c5.metric("センシティブ比率（%）", sens_rate)
+    c6.metric("ポリシー整合率（%）", policy_ok_rate)
+
+    # 簡易：トピック分布
+    topics = Counter()
+    for c in cons:
+        for t in (c.get("topics") or []):
+            topics[t]+=1
+    if topics:
+        st.write("**トピック件数（上位）**")
+        for k,v in topics.most_common(10):
+            st.write(f"- {k}: {v}")
+
+# -------------------- メイン制御 --------------------
+def main():
+    # 認証済判定
+    token = st.session_state.get("sb_token")
+    if not token:
+        auth_view()
+        return
+
+    # プロファイルと所属チェック（なければ作成ウィザードへ）
+    uid, org_id, meta = ensure_profile_and_org()
+    st.sidebar.success(f"{meta['org_name']}（{meta['role']}）としてログイン中")
+    if st.sidebar.button("ログアウト"):
+        st.session_state.clear(); st.rerun()
+
+    # タブ：相談 / ダッシュボード / 設定
+    tab = st.sidebar.radio("メニュー", ["相談","ダッシュボード","設定"])
+
+    if tab == "相談":
+        consult_and_generate(uid, org_id)
+    elif tab == "ダッシュボード":
+        dashboard(org_id)
+    else:
+        policy_editor(org_id)
+        st.info("※ 詳細な管理画面は今後拡充します。")
+
+main()
